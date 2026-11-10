@@ -32,6 +32,8 @@
 #define PM_LOG_PREFIX "pathmask: "
 #define MAX_HIDE_TARGETS 64
 #define MAX_DENY_UIDS 1024
+#define MAX_TARGET_UIDS 8
+#define UID_RULES_LEN 4096
 #define TARGET_PATHS_LEN 4096
 #define TARGET_TEXT_LEN 256
 #define UID_LIST_LEN 8192
@@ -162,6 +164,23 @@ static char deny_uids[UID_LIST_LEN];
 module_param_string(deny_uids, deny_uids, sizeof(deny_uids), 0644);
 MODULE_PARM_DESC(deny_uids, "Comma-separated scope UIDs: hidden in deny mode, exempt in allow mode");
 
+/*
+ * Per-UID rules (VEIL patch).
+ *
+ * Format: uid=path1|path2;uid=path3|path4
+ * Each path is hidden only from the UIDs listed in front of it, so two apps
+ * can see completely different subsets of the same storage tree. Same path
+ * listed under several UIDs is merged into one target with a small UID set.
+ *
+ * These rules are evaluated independently of scope_mode, so the caller should
+ * leave scope_mode=global when relying on uid_rules alone; deny/allow scope
+ * still acts as an outer gate on top of them.
+ */
+static char uid_rules[UID_RULES_LEN];
+module_param_string(uid_rules, uid_rules, sizeof(uid_rules), 0644);
+MODULE_PARM_DESC(uid_rules,
+		 "Per-UID targets: uid=path1|path2;uid=path3 (path separator '|', rule separator ';')");
+
 struct hidden_target {
 	dev_t dev;
 	unsigned long long ino;
@@ -184,6 +203,12 @@ struct hidden_target {
 	bool under_storage;
 	size_t storage_suffix_off;
 	size_t storage_suffix_len;
+	/*
+	 * uid_count == 0: this target has no per-UID restriction and follows
+	 * scope_mode. uid_count > 0: only the listed UIDs see it as hidden.
+	 */
+	unsigned int uid_count;
+	uid_t uids[MAX_TARGET_UIDS];
 };
 
 static struct hidden_target targets[MAX_HIDE_TARGETS];
@@ -325,6 +350,31 @@ static int resolve_path_helpers(void)
 	return 0;
 }
 
+/*
+ * Per-UID filter for one target. Targets without an explicit UID set keep the
+ * legacy behaviour (hide from whoever scope_mode allows).
+ */
+static inline bool pm_uid_allowed(const struct hidden_target *t)
+{
+	uid_t uid, euid, fsuid;
+	unsigned int i;
+
+	if (!t->uid_count)
+		return true;
+
+	uid = __kuid_val(current_uid());
+	euid = __kuid_val(current_euid());
+	fsuid = __kuid_val(current_fsuid());
+
+	for (i = 0; i < t->uid_count; i++) {
+		if (uid == t->uids[i] || euid == t->uids[i] ||
+		    fsuid == t->uids[i])
+			return true;
+	}
+
+	return false;
+}
+
 static inline bool is_target_inode(const struct inode *inode)
 {
 	unsigned int i;
@@ -336,7 +386,8 @@ static inline bool is_target_inode(const struct inode *inode)
 		if (!targets[i].inode_ok)
 			continue;
 		if (inode->i_ino == targets[i].ino &&
-		    inode->i_sb->s_dev == targets[i].dev)
+		    inode->i_sb->s_dev == targets[i].dev &&
+		    pm_uid_allowed(&targets[i]))
 			return true;
 	}
 
@@ -350,7 +401,8 @@ static inline bool is_target_ino(__u64 ino)
 	for (i = 0; i < target_count; i++) {
 		if (!targets[i].inode_ok)
 			continue;
-		if (ino == (__u64)targets[i].ino)
+		if (ino == (__u64)targets[i].ino &&
+		    pm_uid_allowed(&targets[i]))
 			return true;
 	}
 
@@ -603,6 +655,7 @@ static int add_target_path(const char *path_name)
 	strscpy(targets[target_count].path, path_name,
 		sizeof(targets[target_count].path));
 	targets[target_count].under_storage = false;
+	targets[target_count].uid_count = 0;
 	for (i = 0; i < pm_storage_root_count; i++) {
 		size_t rlen = pm_storage_roots[i].len;
 
@@ -651,6 +704,97 @@ static int resolve_target_paths(const char *paths)
 
 	if (!target_count)
 		return ret;
+
+	return 0;
+}
+
+/*
+ * Register one path for a single UID. The same path listed under several UIDs
+ * is merged into one target so the 64-entry table is not wasted on duplicates.
+ */
+static int add_uid_target(const char *path_name, uid_t uid)
+{
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < target_count; i++) {
+		if (strcmp(targets[i].path, path_name))
+			continue;
+		if (targets[i].uid_count >= MAX_TARGET_UIDS) {
+			pr_warn(PM_LOG_PREFIX
+				"%s already has %u uid(s), skip %u\n",
+				path_name, targets[i].uid_count, uid);
+			return -ENOSPC;
+		}
+		targets[i].uids[targets[i].uid_count++] = uid;
+		return 0;
+	}
+
+	ret = add_target_path(path_name);
+	if (ret)
+		return ret;
+
+	targets[target_count - 1].uids[0] = uid;
+	targets[target_count - 1].uid_count = 1;
+
+	return 0;
+}
+
+static int parse_uid_rules(void)
+{
+	char *buf, *cursor, *group;
+	unsigned int added = 0;
+
+	if (!uid_rules[0])
+		return 0;
+
+	buf = kstrdup(uid_rules, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	cursor = buf;
+	while ((group = strsep(&cursor, ";")) != NULL) {
+		char *eq, *pc, *item;
+		long uid;
+
+		group = strim(group);
+		if (!*group)
+			continue;
+
+		eq = strchr(group, '=');
+		if (!eq) {
+			pr_warn(PM_LOG_PREFIX
+				"uid_rules: missing '=' in \"%s\", skip\n",
+				group);
+			continue;
+		}
+
+		*eq = '\0';
+		if (kstrtol(strim(group), 10, &uid) || uid < 0) {
+			pr_warn(PM_LOG_PREFIX "uid_rules: bad uid \"%s\", skip\n",
+				group);
+			continue;
+		}
+
+		pc = eq + 1;
+		while ((item = strsep(&pc, "|")) != NULL) {
+			item = strim(item);
+			if (!*item)
+				continue;
+			if (add_uid_target(item, (uid_t)uid) == 0)
+				added++;
+		}
+	}
+
+	kfree(buf);
+
+	if (!added) {
+		pr_err(PM_LOG_PREFIX "uid_rules: no usable rule parsed\n");
+		return -ENOENT;
+	}
+
+	pr_info(PM_LOG_PREFIX
+		"uid_rules: %u per-uid target entry(ies) registered\n", added);
 
 	return 0;
 }
@@ -1492,7 +1636,13 @@ out:
 
 static int __init pathmask_init(void)
 {
-	const char *paths = target_paths[0] ? target_paths : target_path;
+	/*
+	 * With uid_rules in play the legacy single-path default would point at
+	 * a path that may not exist and abort the load, so it is only used when
+	 * no per-UID rules were supplied.
+	 */
+	const char *paths = target_paths[0] ? target_paths :
+			    (uid_rules[0] ? NULL : target_path);
 	int ret;
 
 	ret = pm_symrecon_init();
@@ -1520,10 +1670,23 @@ static int __init pathmask_init(void)
 
 	discover_storage_aliases();
 
-	ret = resolve_target_paths(paths);
-	if (ret) {
+	if (paths) {
+		ret = resolve_target_paths(paths);
+		if (ret && !uid_rules[0]) {
+			pr_err(PM_LOG_PREFIX "no valid targets (err=%d)\n", ret);
+			return ret;
+		}
+	}
+
+	ret = parse_uid_rules();
+	if (ret && !target_count) {
 		pr_err(PM_LOG_PREFIX "no valid targets (err=%d)\n", ret);
 		return ret;
+	}
+
+	if (!target_count) {
+		pr_err(PM_LOG_PREFIX "no valid targets\n");
+		return -ENOENT;
 	}
 
 	kp_inode_perm.kp.symbol_name = "inode_permission";
