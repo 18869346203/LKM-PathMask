@@ -32,7 +32,7 @@
 #define PM_LOG_PREFIX "pathmask: "
 #define MAX_HIDE_TARGETS 64
 #define MAX_DENY_UIDS 1024
-#define MAX_TARGET_UIDS 8
+#define MAX_TARGET_UIDS 64
 #define UID_RULES_LEN 4096
 #define TARGET_PATHS_LEN 4096
 #define TARGET_TEXT_LEN 256
@@ -350,6 +350,8 @@ static int resolve_path_helpers(void)
 	return 0;
 }
 
+static inline bool should_hide_for_current(void);
+
 /*
  * Per-UID filter for one target. Targets without an explicit UID set keep the
  * legacy behaviour (hide from whoever scope_mode allows).
@@ -375,6 +377,11 @@ static inline bool pm_uid_allowed(const struct hidden_target *t)
 	return false;
 }
 
+/*
+ * A target carrying its own UID set is evaluated on its own: it hides from the
+ * listed UIDs regardless of scope_mode, so per-app rules and the shared
+ * deny/allow list can be loaded together and stay independent.
+ */
 static inline bool is_target_inode(const struct inode *inode)
 {
 	unsigned int i;
@@ -385,9 +392,12 @@ static inline bool is_target_inode(const struct inode *inode)
 	for (i = 0; i < target_count; i++) {
 		if (!targets[i].inode_ok)
 			continue;
-		if (inode->i_ino == targets[i].ino &&
-		    inode->i_sb->s_dev == targets[i].dev &&
-		    pm_uid_allowed(&targets[i]))
+		if (inode->i_ino != targets[i].ino ||
+		    inode->i_sb->s_dev != targets[i].dev)
+			continue;
+		if (targets[i].uid_count)
+			return pm_uid_allowed(&targets[i]);
+		if (should_hide_for_current())
 			return true;
 	}
 
@@ -401,8 +411,11 @@ static inline bool is_target_ino(__u64 ino)
 	for (i = 0; i < target_count; i++) {
 		if (!targets[i].inode_ok)
 			continue;
-		if (ino == (__u64)targets[i].ino &&
-		    pm_uid_allowed(&targets[i]))
+		if (ino != (__u64)targets[i].ino)
+			continue;
+		if (targets[i].uid_count)
+			return pm_uid_allowed(&targets[i]);
+		if (should_hide_for_current())
 			return true;
 	}
 
@@ -886,7 +899,7 @@ static int perm_inode_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	if (atomic_cmpxchg(&pm_perm_seen, 0, 1) == 0)
 		pr_info(PM_LOG_PREFIX "inode_permission hook fired (first time)\n");
 
-	d->matched = should_hide_for_current() && is_target_inode(inode);
+	d->matched = is_target_inode(inode);
 	return 0;
 }
 
@@ -920,7 +933,7 @@ static int getattr_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	if (path && path->dentry)
 		inode = d_inode(path->dentry);
 
-	d->matched = should_hide_for_current() && is_target_inode(inode);
+	d->matched = is_target_inode(inode);
 	return 0;
 }
 
@@ -1542,7 +1555,7 @@ static int getdents_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
 	d->dirent = NULL;
 	d->kbuf = NULL;
 	d->kbuf_len = 0;
-	d->scoped = should_hide_for_current();
+	d->scoped = true; /* per-UID targets are evaluated inside is_target_ino() */
 
 	if (!d->scoped || !user_regs)
 		return 0;
